@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bertdm"
+version = "0.1.0"
+description = "NeoBERT encoder decision model with isolated choice attention"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.5,<3",
+    "transformers==4.48.3",
+    "huggingface-hub>=0.28,<1",
+    "safetensors>=0.5,<1",
+]
+
+[project.optional-dependencies]
+data = ["pyarrow>=15,<27"]
+test = ["pytest>=8", "pyarrow>=15,<27"]
+
+[tool.setuptools.packages.find]
+include = ["bertdm*"]
+
+[tool.setuptools.package-data]
+"bertdm._vendor" = ["LICENSE*", "NOTICE.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
