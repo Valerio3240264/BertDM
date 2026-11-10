@@ -9,7 +9,8 @@ from pathlib import Path
 import pytest
 
 
-def test_notebook_top_to_bottom_and_resume(pipeline, examples, tmp_path, monkeypatch):
+@pytest.mark.parametrize("num_processes", [1, 2])
+def test_notebook_top_to_bottom_and_resume(pipeline, examples, tmp_path, monkeypatch, num_processes):
   pytest.importorskip("IPython")
   root = Path(__file__).parents[1]
   for line in (root / "requirements-kaggle.txt").read_text().splitlines():
@@ -49,6 +50,7 @@ def test_notebook_top_to_bottom_and_resume(pipeline, examples, tmp_path, monkeyp
   cfg.update(repo_dir=str(root), output_dir=str(tmp_path / "working" / "run1"),
              cache_dir=str(tmp_path / "working" / "cache"), allow_downloads=False,
              install_dependencies=False, device="cpu", stop_after_updates=1, datasets=sources)
+  cfg["distributed"] = {"num_processes": num_processes}
   cfg["model"].update(checkpoint=str(checkpoint), max_length=48, head_width=17, dropout=0.0)
   cfg["training"].update(epochs=1, micro_batch_size=1, gradient_accumulation=2,
                          samples_per_epoch=5, log_every_updates=1, save_every_updates=2, precision="fp32")

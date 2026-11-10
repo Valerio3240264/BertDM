@@ -16,10 +16,12 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.nn import functional as F
+from torch.nn.parallel import DistributedDataParallel
 
+from .distributed import DistributedRuntime
 from .download import sha256
 from .pipeline import DecisionPipeline
-from .training_data import digest_json, epoch_plan, materialize_example, training_batch
+from .training_data import digest_json, epoch_plan, materialize_example, training_batch, partition_window
 
 
 MEMORY_HELP = ("Reduce max_length (512 -> 256 -> 128) and micro_batch_size to 1; increase "
@@ -91,9 +93,14 @@ def seed_everything(seed, deterministic=True):
   torch.backends.cudnn.allow_tf32 = False
 
 
-def random_state():
+def random_state(device=None):
+  selected = torch.device(device) if device is not None else None
+  use_cuda = torch.cuda.is_available() and (selected is None or selected.type == "cuda")
   return {"python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state(),
-          "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None}
+          "cuda": ([torch.cuda.get_rng_state(selected)] if selected is not None else torch.cuda.get_rng_state_all())
+          if use_cuda else None,
+          "cuda_device": (selected.index if selected.index is not None else torch.cuda.current_device())
+          if use_cuda and selected is not None else None}
 
 
 def restore_random_state(state):
@@ -101,6 +108,9 @@ def restore_random_state(state):
   np.random.set_state(state["numpy"])
   torch.set_rng_state(state["torch"])
   if state["cuda"] is not None and torch.cuda.is_available():
+    if state.get("cuda_device") is not None:
+      torch.cuda.set_rng_state(state["cuda"][0], state["cuda_device"])
+      return
     if len(state["cuda"]) != torch.cuda.device_count():
       raise ValueError("CUDA device count differs from the saved random state")
     torch.cuda.set_rng_state_all(state["cuda"])
@@ -126,12 +136,13 @@ def autocast_context(precision, device):
                         dtype=torch.bfloat16 if precision == "bf16" else torch.float16)
 
 
-def environment_info():
+def environment_info(device=None):
   import transformers
   return {"python": platform.python_version(), "platform": platform.system(),
           "torch": str(torch.__version__), "transformers": transformers.__version__,
           "numpy": np.__version__, "cuda_runtime": torch.version.cuda,
-          "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None}
+          "gpu": torch.cuda.get_device_name(device if device is not None else 0)
+          if torch.cuda.is_available() and (device is None or torch.device(device).type == "cuda") else None}
 
 
 def _to_device(batch, device):
@@ -144,7 +155,7 @@ def smoke_test(pipeline, device, precision, gradient_checkpointing=True, initial
   model = pipeline.model.to(device)
   previous_mode = model.training
   previous_checkpointing = model.backbone.gradient_checkpointing
-  rng = random_state()
+  rng = random_state(device)
   try:
     model.backbone.gradient_checkpointing = gradient_checkpointing
     model.train()
@@ -187,6 +198,7 @@ def _range_name(count, bounds):
 
 @torch.inference_mode()
 def evaluate(pipeline, validation, device, precision, batch_size=1, bounds=(4, 8, 16, 32)):
+  runtime = DistributedRuntime.current(device)
   model = pipeline.model
   was_training = model.training
   model.eval()
@@ -198,13 +210,18 @@ def evaluate(pipeline, validation, device, precision, batch_size=1, bounds=(4, 8
       totals = {"count": 0, "correct": 0, "nll_sum": 0.0}
       bins = {_range_name(n, bounds): {"count": 0, "correct": 0, "nll_sum": 0.0}
               for n in (2, *[b + 1 for b in bounds])}
-      for start in range(0, len(rows), batch_size):
-        batch = _to_device(pipeline.collate([materialize_example(r) for r in rows[start:start + batch_size]]), device)
+      # The unwrapped model has no DDP forward collectives: shards may be empty
+      # or have different batch counts. Never pad validation with duplicate rows.
+      local_rows = rows[runtime.rank::runtime.world_size]
+      finite = True
+      for start in range(0, len(local_rows), batch_size):
+        batch = _to_device(pipeline.collate([materialize_example(r) for r in local_rows[start:start + batch_size]]), device)
         with autocast_context(precision, device):
           output = model(**batch)
         losses = F.cross_entropy(output.logits.float(), batch["labels"], reduction="none")
         if not torch.isfinite(losses).all():
-          raise FloatingPointError(f"Nonfinite validation NLL in {dataset}")
+          finite = False
+          break
         correct = output.logits.argmax(-1) == batch["labels"]
         counts = batch["valid_choice_mask"].sum(-1)
         for n, ok, loss in zip(counts.tolist(), correct.tolist(), losses.tolist()):
@@ -212,6 +229,13 @@ def evaluate(pipeline, validation, device, precision, batch_size=1, bounds=(4, 8
             bucket["count"] += 1
             bucket["correct"] += int(ok)
             bucket["nll_sum"] += loss
+      runtime.check(finite, f"Nonfinite validation NLL in {dataset}", FloatingPointError)
+      buckets = [totals, *bins.values()]
+      statistics = torch.tensor([[b["count"], b["correct"], b["nll_sum"]] for b in buckets],
+                                dtype=torch.float64, device=device)
+      runtime.sum(statistics)
+      for bucket, (count, correct, nll_sum) in zip(buckets, statistics.tolist()):
+        bucket.update(count=int(count), correct=int(correct), nll_sum=nll_sum)
       def finish(bucket):
         n = bucket["count"]
         return {"count": n, "accuracy": bucket["correct"] / n if n else None,
@@ -247,6 +271,9 @@ class Trainer:
   def __init__(self, pipeline, datasets, summaries, config, output_dir, device):
     self.pipeline, self.datasets, self.summaries, self.config = pipeline, datasets, summaries, config
     self.output_dir, self.device = Path(output_dir), torch.device(device)
+    if self.device.type == "cuda" and self.device.index is None:
+      self.device = torch.device("cuda", torch.cuda.current_device())
+    self.runtime = DistributedRuntime.current(self.device)
     if set(datasets) != {"train", "validation"} or set(datasets["train"]) != set(datasets["validation"]):
       raise ValueError("Supply matching dataset names in separate train and validation mappings")
     self.weights = config.dataset_weights or {name: 1.0 for name in datasets["train"]}
@@ -263,20 +290,29 @@ class Trainer:
     if config.selection_dataset not in (*datasets["validation"], "macro"):
       raise ValueError("selection_dataset must be macro or a validation dataset name")
     self.precision = resolve_precision(config.precision, self.device)
+    precisions = self.runtime.gather(self.precision)
+    self.runtime.check(len(set(precisions)) == 1, "All ranks must use the same resolved precision")
     self.device_identity = {"type": self.device.type,
                             "index": (self.device.index or 0) if self.device.type == "cuda" else None}
-    self.model = pipeline.model.to(self.device)
-    self.model.backbone.gradient_checkpointing = config.gradient_checkpointing
+    self.raw_model = pipeline.model.to(self.device)
+    self.raw_model.backbone.gradient_checkpointing = config.gradient_checkpointing
+    self.model = self.raw_model
+    if self.runtime.enabled:
+      self.model = DistributedDataParallel(
+          self.raw_model, device_ids=[self.device.index] if self.device.type == "cuda" else None,
+          output_device=self.device.index if self.device.type == "cuda" else None,
+          broadcast_buffers=False, find_unused_parameters=False, gradient_as_bucket_view=True)
     groups = []
     for component in ("backbone", "head"):
       for decay in (True, False):
-        parameters = [p for _, p in getattr(self.model, component).named_parameters()
+        parameters = [p for _, p in getattr(self.raw_model, component).named_parameters()
                       if p.requires_grad and (p.ndim >= 2) == decay]
         groups.append({"params": parameters, "lr": config.encoder_lr if component == "backbone" else config.head_lr,
                        "weight_decay": config.weight_decay if decay else 0.0,
                        "name": component + ("_decay" if decay else "_no_decay")})
     self.optimizer = torch.optim.AdamW(groups)
-    updates = math.ceil(self.samples / (config.micro_batch_size * config.gradient_accumulation))
+    self.global_batch_size = config.micro_batch_size * config.gradient_accumulation * self.runtime.world_size
+    updates = math.ceil(self.samples / self.global_batch_size)
     self.total_updates = updates * config.epochs
     warmup = int(self.total_updates * config.warmup_ratio)
     def schedule(step):
@@ -288,108 +324,132 @@ class Trainer:
                                       init_scale=config.initial_scale)
     self.state = {"epoch": 0, "sample_offset": 0, "global_step": 0, "samples_seen": 0,
                   "best_score": None, "best_checkpoint": None, "elapsed_seconds": 0.0}
-    self.signature = digest_json({"training": asdict(config), "model": pipeline.model.config.to_dict(),
+    self.signature = digest_json({"training": asdict(config), "world_size": self.runtime.world_size,
+                                  "samples_per_epoch": self.samples,
+                                  "sizes": {s: {n: len(rows) for n, rows in values.items()}
+                                            for s, values in datasets.items()},
+                                  "model": pipeline.model.config.to_dict(),
                                   "data": {s: {n: r["cache_key"] for n, r in v.items()} for s, v in summaries.items()},
                                   "trainer_code": sha256(__file__),
                                   "model_code": {name: sha256(Path(__file__).parent / name) for name in (
-                                      "model.py", "masking.py", "pipeline.py", "config.py", "_vendor/neobert.py",
+                                      "model.py", "masking.py", "pipeline.py", "config.py", "distributed.py", "_vendor/neobert.py",
                                       "_vendor/rotary.py", "_vendor/swiglu.py")}})
-    self.output_dir.mkdir(parents=True, exist_ok=True)
-    self._resume_required = (self.output_dir / "latest.json").is_file()
-    if (self.output_dir / "run.json").is_file():
-      previous = json.loads((self.output_dir / "run.json").read_text(encoding="utf-8"))
-      if previous["signature"] != self.signature:
-        raise ValueError("Output directory belongs to a different run; choose a new output directory")
-    _atomic_json(self.output_dir / "run.json", {"training": asdict(config), "model": self.model.config.to_dict(),
-                                               "precision": self.precision, "environment": environment_info(),
-                                               "summaries": summaries, "signature": self.signature,
-                                               "effective_batch_size": config.micro_batch_size * config.gradient_accumulation,
-                                               "samples_per_epoch": self.samples, "total_updates": self.total_updates})
+    signatures = self.runtime.gather(self.signature)
+    self.runtime.check(len(set(signatures)) == 1, "Configuration/data/code must match on every rank")
+    def write_metadata():
+      self.output_dir.mkdir(parents=True, exist_ok=True)
+      existing = (self.output_dir / "latest.json").is_file()
+      if (self.output_dir / "run.json").is_file():
+        previous = json.loads((self.output_dir / "run.json").read_text(encoding="utf-8"))
+        if previous["signature"] != self.signature:
+          raise ValueError("Output directory belongs to a different run; choose a new output directory")
+      _atomic_json(self.output_dir / "run.json", {
+          "training": asdict(config), "model": self.raw_model.config.to_dict(),
+          "precision": self.precision, "environment": environment_info(self.device),
+          "summaries": summaries, "signature": self.signature, "world_size": self.runtime.world_size,
+          "effective_batch_size": self.global_batch_size,
+          "samples_per_epoch": self.samples, "total_updates": self.total_updates})
+      return existing
+    self._resume_required = self.runtime.primary_call(write_metadata)
 
-  def _log(self, record):
-    with (self.output_dir / "history.jsonl").open("a", encoding="utf-8") as stream:
-      stream.write(json.dumps(record) + "\n")
-    print(json.dumps(record), flush=True)
+  def _log(self, record, *, print_record=True):
+    def write():
+      with (self.output_dir / "history.jsonl").open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record) + "\n")
+      if print_record:
+        print(json.dumps(record), flush=True)
+    self.runtime.primary_call(write)
 
   def resume(self, path):
-    path = resolve_checkpoint(path)
-    # Only load training_state.pt produced by this project and trusted by you.
-    payload = torch.load(path / "training_state.pt", map_location="cpu", weights_only=False)
-    if payload["signature"] != self.signature:
-      raise ValueError("Resume configuration/data/code differs. Restore the original settings; use a bundle "
-                       "without optimizer state for an intentional new fine-tuning run.")
-    if (payload["precision"] != self.precision or payload["environment"] != environment_info()
-        or payload["device"] != self.device_identity):
-      raise ValueError("Resume runtime/precision differs; exact continuation requires the same environment")
-    # Also load model weights here, so callers cannot accidentally resume state into fresh weights.
-    from safetensors.torch import load_model
-    load_model(self.model, str(path / "model.safetensors"), strict=True, device=str(self.device))
-    self.optimizer.load_state_dict(payload["optimizer"])
-    self.scheduler.load_state_dict(payload["scheduler"])
-    self.scaler.load_state_dict(payload["scaler"])
-    self.state = payload["progress"]
-    history = self.output_dir / "history.jsonl"
-    if history.is_file():
-      # An interrupted same-directory run may have logged unsaved updates.
-      # Replay them from the saved boundary without retaining stale duplicate steps.
-      records = []
-      for line in history.read_text(encoding="utf-8").splitlines():
-        try:
-          record = json.loads(line)
-        except json.JSONDecodeError:
-          continue  # A crash may leave an incomplete final log record.
-        if record.get("step", 0) <= self.state["global_step"]:
-          records.append(record)
-      temporary = history.with_suffix(".tmp")
-      temporary.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
-      temporary.replace(history)
-    # Preserve the previous best when writing into a new /kaggle/working directory.
-    old_root = path.parent.parent
-    old_best = self.state["best_checkpoint"]
-    if old_best and not (self.output_dir / old_best).exists():
-      source = old_root / old_best
-      if not source.is_dir():
-        raise ValueError("Previous best checkpoint is missing; persist the whole output directory")
-      destination = self.output_dir / old_best
-      destination.parent.mkdir(parents=True, exist_ok=True)
-      shutil.copytree(source, destination)
-      _atomic_json(self.output_dir / "best.json", {"checkpoint": old_best, "score": self.state["best_score"]})
-    restore_random_state(payload["random"])
+    def load_and_validate():
+      folder = resolve_checkpoint(path)
+      # Only trust training_state.pt files produced by your own runs.
+      payload = torch.load(folder / "training_state.pt", map_location="cpu", weights_only=False)
+      if payload.get("format_version") != 2 or payload.get("world_size") != self.runtime.world_size:
+        raise ValueError("Checkpoint format/world size differs; start a new run from its inference bundle")
+      if payload["signature"] != self.signature:
+        raise ValueError("Resume configuration/data/code differs. Restore the original settings; use a bundle "
+                         "without optimizer state for an intentional new fine-tuning run.")
+      rank_state = payload["ranks"][self.runtime.rank]
+      if (payload["precision"] != self.precision or rank_state["environment"] != environment_info(self.device)
+          or rank_state["device"] != self.device_identity or rank_state["rank"] != self.runtime.rank):
+        raise ValueError("Resume runtime/precision/device differs; exact continuation requires the same environment")
+      return folder, payload, rank_state
+    path, payload, rank_state = self.runtime.local_call(load_and_validate)
+    def restore_training():
+      from safetensors.torch import load_model
+      load_model(self.raw_model, str(path / "model.safetensors"), strict=True, device=str(self.device))
+      self.optimizer.load_state_dict(payload["optimizer"])
+      self.scheduler.load_state_dict(payload["scheduler"])
+      self.scaler.load_state_dict(rank_state["scaler"])
+      self.state = dict(payload["progress"])
+    self.runtime.local_call(restore_training)
+    scales = self.runtime.gather(self.scaler.get_scale())
+    self.runtime.check(len(set(scales)) == 1, "Saved AMP scaler values disagree across ranks")
+    def restore_files():
+      history = self.output_dir / "history.jsonl"
+      if history.is_file():
+        records = []
+        for line in history.read_text(encoding="utf-8").splitlines():
+          try:
+            record = json.loads(line)
+          except json.JSONDecodeError:
+            continue
+          if record.get("step", 0) <= self.state["global_step"]:
+            records.append(record)
+        temporary = history.with_suffix(".tmp")
+        temporary.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+        temporary.replace(history)
+      old_best = self.state["best_checkpoint"]
+      if old_best and not (self.output_dir / old_best).exists():
+        previous_best = path.parent.parent / old_best
+        if not previous_best.is_dir():
+          raise ValueError("Previous best checkpoint is missing; persist the whole output directory")
+        destination = self.output_dir / old_best
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(previous_best, destination)
+        _atomic_json(self.output_dir / "best.json", {"checkpoint": old_best, "score": self.state["best_score"]})
+    self.runtime.primary_call(restore_files)
+    restore_random_state(rank_state["random"])
     self._resume_required = False
-    self._log({"kind": "resume", "step": self.state["global_step"],
+    self._log({"kind": "resume", "step": self.state["global_step"], "world_size": self.runtime.world_size,
                "epoch": self.state["epoch"], "sample_offset": self.state["sample_offset"]})
-    print(f"Resumed optimizer step {self.state['global_step']}, epoch {self.state['epoch']}, "
-          f"next sample {self.state['sample_offset']}")
 
   def save_checkpoint(self, *, is_best=False):
+    """Every rank participates; only rank zero serializes shared state."""
     relative = f"checkpoints/step-{self.state['global_step']:08d}"
-    folder = self.output_dir / relative
     if is_best:
       self.state["best_checkpoint"] = relative
-    folder.mkdir(parents=True, exist_ok=True)
-    if not (folder / "checkpoint.json").is_file():
-      self.pipeline.save_pretrained(folder)
-    payload = {"signature": self.signature, "progress": dict(self.state), "random": random_state(),
-               "optimizer": self.optimizer.state_dict(), "scheduler": self.scheduler.state_dict(),
-               "scaler": self.scaler.state_dict(), "precision": self.precision,
-               "environment": environment_info(), "device": self.device_identity}
-    temporary = folder / "training_state.tmp"
-    torch.save(payload, temporary)
-    temporary.replace(folder / "training_state.pt")
-    _atomic_json(folder / "checkpoint.json", {"signature": self.signature, "step": self.state["global_step"]})
-    _atomic_json(self.output_dir / "latest.json", {"checkpoint": relative})
-    if is_best:
-      _atomic_json(self.output_dir / "best.json", {"checkpoint": relative, "score": self.state["best_score"]})
-    if self.config.prune_unreferenced_checkpoints:
-      keep = {relative, self.state["best_checkpoint"]}
-      root = (self.output_dir / "checkpoints").resolve()
-      for candidate in root.glob("step-*"):
-        resolved = candidate.resolve()
-        # Only remove our own completed, unreferenced child directories.
-        if (resolved.parent == root and candidate.is_dir() and (candidate / "checkpoint.json").is_file()
-            and f"checkpoints/{candidate.name}" not in keep):
-          shutil.rmtree(resolved)
-    return folder
+    ranks = self.runtime.gather({"rank": self.runtime.rank, "random": random_state(self.device),
+                                 "scaler": self.scaler.state_dict(), "environment": environment_info(self.device),
+                                 "device": self.device_identity})
+    def write():
+      folder = self.output_dir / relative
+      folder.mkdir(parents=True, exist_ok=True)
+      if not (folder / "checkpoint.json").is_file():
+        self.pipeline.save_pretrained(folder)
+      payload = {"format_version": 2, "world_size": self.runtime.world_size, "ranks": ranks,
+                 "signature": self.signature, "progress": dict(self.state),
+                 "optimizer": self.optimizer.state_dict(), "scheduler": self.scheduler.state_dict(),
+                 "precision": self.precision}
+      temporary = folder / "training_state.tmp"
+      torch.save(payload, temporary)
+      temporary.replace(folder / "training_state.pt")
+      _atomic_json(folder / "checkpoint.json", {"signature": self.signature, "step": self.state["global_step"],
+                                                "format_version": 2, "world_size": self.runtime.world_size})
+      _atomic_json(self.output_dir / "latest.json", {"checkpoint": relative})
+      if is_best:
+        _atomic_json(self.output_dir / "best.json", {"checkpoint": relative, "score": self.state["best_score"]})
+      if self.config.prune_unreferenced_checkpoints:
+        keep = {relative, self.state["best_checkpoint"]}
+        root = (self.output_dir / "checkpoints").resolve()
+        for candidate in root.glob("step-*"):
+          resolved = candidate.resolve()
+          if (resolved.parent == root and candidate.is_dir() and (candidate / "checkpoint.json").is_file()
+              and f"checkpoints/{candidate.name}" not in keep):
+            shutil.rmtree(resolved)
+      return str(folder)
+    return Path(self.runtime.primary_call(write))
 
   def _validate_and_save(self):
     started = time.perf_counter()
@@ -405,7 +465,7 @@ class Trainer:
       self.state["best_score"] = score
     self._log({"kind": "validation", "step": self.state["global_step"], "metrics": metrics,
                "selection": f"{self.config.selection_dataset}/{self.config.selection_metric}",
-               "is_best": improved, "seconds": time.perf_counter() - started})
+               "is_best": improved, "seconds": self.runtime.maximum(time.perf_counter() - started)})
     self.save_checkpoint(is_best=improved)
     return metrics
 
@@ -426,24 +486,35 @@ class Trainer:
         while self.state["sample_offset"] < self.samples:
           started = time.perf_counter()
           offset = self.state["sample_offset"]
-          chunk = plan[offset:offset + config.micro_batch_size * config.gradient_accumulation]
+          chunk = plan[offset:offset + self.global_batch_size]
           self.model.train()
           self.optimizer.zero_grad(set_to_none=True)
           loss_sum = 0.0
           used_lrs = {group["name"]: group["lr"] for group in self.optimizer.param_groups}
-          for start in range(0, len(chunk), config.micro_batch_size):
-            draws = chunk[start:start + config.micro_batch_size]
+          microsteps = partition_window(chunk, self.runtime.rank, self.runtime.world_size, config.micro_batch_size)
+          for microstep, (draws, active) in enumerate(microsteps):
             batch = _to_device(training_batch(self.pipeline, self.datasets["train"], draws, config.shuffle_choices), self.device)
-            with autocast_context(self.precision, self.device):
-              output = self.model(**batch)
-              # Weight partial microbatches by example count, including the final accumulation window.
-              loss = output.loss * (len(draws) / len(chunk))
-            if not torch.isfinite(output.loss):
-              raise FloatingPointError(f"Nonfinite training loss at step {self.state['global_step']}; draws={draws}")
-            loss_sum += float(output.loss.detach()) * len(draws)
-            self.scaler.scale(loss).backward()
+            synchronize = not self.runtime.enabled or microstep == len(microsteps) - 1
+            context = nullcontext() if synchronize else self.model.no_sync()
+            # no_sync must cover forward AND backward. Every rank has the same
+            # microstep count, including zero-weight dummy rows in the tail.
+            with context:
+              with autocast_context(self.precision, self.device):
+                output = self.model(**batch)
+                per_example = F.cross_entropy(output.logits.float(), batch["labels"], reduction="none")
+                weights = torch.tensor(active, dtype=per_example.dtype, device=self.device)
+                weighted_sum = (per_example * weights).sum()
+                # DDP averages rank gradients. This yields a global example mean
+                # across the complete accumulation window, even for uneven tails.
+                loss = weighted_sum * (self.runtime.world_size / len(chunk))
+              self.runtime.check(torch.isfinite(per_example).all(),
+                                 f"Nonfinite training loss at step {self.state['global_step']}", FloatingPointError)
+              loss_sum += float(weighted_sum.detach())
+              self.scaler.scale(loss).backward()
           self.scaler.unscale_(self.optimizer)
-          norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), config.max_grad_norm, error_if_nonfinite=True)
+          norm = torch.nn.utils.clip_grad_norm_(self.raw_model.parameters(), config.max_grad_norm, error_if_nonfinite=False)
+          self.runtime.check(torch.isfinite(norm), "Nonfinite gradient norm; reduce fp16 initial_scale or use bf16",
+                             FloatingPointError)
           self.scaler.step(self.optimizer)
           self.scaler.update()
           self.scheduler.step()
@@ -451,18 +522,18 @@ class Trainer:
           self.state["sample_offset"] += len(chunk)
           self.state["samples_seen"] += len(chunk)
           self.state["global_step"] += 1
-          seconds = time.perf_counter() - started
+          loss_sum = self.runtime.sum(torch.tensor(loss_sum, device=self.device, dtype=torch.float64)).item()
+          if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+          seconds = self.runtime.maximum(time.perf_counter() - started)
           self.state["elapsed_seconds"] += seconds
           record = {"kind": "train", "epoch": epoch, "step": self.state["global_step"],
                     "sample_offset": self.state["sample_offset"], "loss": loss_sum / len(chunk),
                     "learning_rates": used_lrs, "grad_norm": float(norm), "scale": self.scaler.get_scale(),
-                    "examples": len(chunk), "datasets": dict(Counter(n for n, _, _ in chunk)),
+                    "examples": len(chunk), "world_size": self.runtime.world_size,
+                    "datasets": dict(Counter(n for n, _, _ in chunk)),
                     "seconds": seconds, "examples_per_second": len(chunk) / seconds}
-          # Persist every update; print at a configurable cadence.
-          with (self.output_dir / "history.jsonl").open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(record) + "\n")
-          if self.state["global_step"] % config.log_every_updates == 0:
-            print(json.dumps(record), flush=True)
+          self._log(record, print_record=self.state["global_step"] % config.log_every_updates == 0)
           stop = stop_after_updates is not None and self.state["global_step"] >= stop_after_updates
           if self.state["global_step"] % config.save_every_updates == 0 and not stop:
             self.save_checkpoint()

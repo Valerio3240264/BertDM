@@ -1,5 +1,9 @@
 # Training notebook validation
 
+For the subsequent multi-worker implementation and its 61-test regression run,
+see [distributed training validation](distributed.md). The details below record
+the original single-process notebook implementation and its earlier checks.
+
 `train.ipynb` was added and checked on 2026-11-10. It imports the repository's
 `DecisionPipeline`, dataset normalizers, tokenizer/collator, and decision model.
 Reusable cache/augmentation and training code lives in `bertdm/training_data.py`

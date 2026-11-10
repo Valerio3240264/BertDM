@@ -34,6 +34,11 @@ logic in Python modules and use the same preprocessing for training and inferenc
 - Mean-pool only choice content. Use one shared gated scoring head, mask invalid
   slots, and preserve offline model/config/tokenizer save and reload.
 - Keep sequential-position order sensitivity and truncation limits documented.
+- DDP ranks partition one deterministic global sampling plan. Normalize losses by
+  the global real-example count, exclude dummy tail slots, and never pad validation
+  with duplicated examples. Keep collective call counts aligned across ranks.
+- Only rank zero writes shared artifacts. Every rank participates in checkpointing;
+  preserve per-rank RNG/scaler state and require a fixed world size for exact resume.
 
 ## Checks
 
@@ -56,3 +61,6 @@ checks as task accuracy or Kaggle capacity measurements.
 
 Keep datasets, weights, environments, caches, and generated outputs in ignored
 locations. Update examples and documentation when public behavior changes.
+
+Distributed tests spawn localhost Gloo workers; sandboxed runs need permission for
+local sockets. Actual multi-GPU CUDA tests require a Linux/NCCL runtime and GPUs.

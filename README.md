@@ -31,6 +31,19 @@ see [notebook validation](docs/notebook-validation.md) for executed checks and l
 installed CUDA PyTorch wheel. Reusable training logic is in
 `bertdm/training.py` and `bertdm/training_data.py`.
 
+For multiple allocated GPUs, set `CFG["distributed"]["num_processes"] = 2`
+(or `"auto"`) in the notebook. It launches one DDP worker per GPU. The global
+effective batch is `GPUs × micro_batch_size × gradient_accumulation`; use
+accumulation 4 with two GPUs and microbatch 1 to preserve an effective batch of 8.
+Keep the same worker count when resuming. CUDA DDP uses Linux/NCCL; each GPU holds
+the full model and AdamW state. See [distributed training](docs/distributed.md).
+
+The same JSON configuration saved by the notebook can be launched directly:
+
+```bash
+torchrun --standalone --nnodes=1 --nproc-per-node=2 examples/train_distributed.py --config /kaggle/working/bertdm-run/notebook-config.json
+```
+
 ```bash
 python -m bertdm.download cosmos --output /kaggle/working/data/cosmos
 python -m bertdm.download wikihop --output /kaggle/working/data/wikihop

@@ -160,3 +160,20 @@ def training_batch(pipeline, train, draws, shuffle_choices):
     else:
       rows.append(materialize_example(encoded))
   return pipeline.collate(rows)
+
+
+def partition_window(draws, rank, world_size, micro_batch_size):
+  """Return equal microstep counts, with zero-weight dummy slots in the tail.
+
+  Positions (not dataset row IDs) are partitioned: repeated draws from weighted
+  replacement sampling remain distinct observations. No real draw is dropped.
+  """
+  if not draws or not 0 <= rank < world_size or micro_batch_size <= 0:
+    raise ValueError("Expected a nonempty window and valid rank/batch size")
+  width = world_size * micro_batch_size
+  result = []
+  for start in range(0, len(draws), width):
+    positions = range(start + rank * micro_batch_size, start + (rank + 1) * micro_batch_size)
+    result.append(([draws[i] if i < len(draws) else draws[0] for i in positions],
+                   [i < len(draws) for i in positions]))
+  return result
